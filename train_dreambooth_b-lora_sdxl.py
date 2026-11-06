@@ -13,6 +13,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 
+"""DreamBooth-style B-LoRA training for SDXL.
+
+Updated to work with Python 3.10-3.13 and modern diffusers (>= 0.32) which
+implement LoRA exclusively through PEFT:
+
+  * The two B-LoRA target blocks (unet.up_blocks.0.attentions.{0,1}) are now
+    injected via ``peft.LoraConfig`` using dynamically-computed
+    ``target_modules`` (see ``blora_utils.get_target_modules``). This targets
+    exactly the same modules (to_q/to_k/to_v/to_out.0 of every attention layer
+    inside the two blocks) as the original pre-PEFT implementation, which
+    relied on ``Attention.set_lora_layer`` - an API that has been removed.
+  * ``logger.warn`` (removed in Python 3.13) replaced with ``logger.warning``.
+  * Checkpoint saving/loading goes through ``get_peft_model_state_dict`` and
+    ``set_peft_model_state_dict``.
+"""
+
 import argparse
 import gc
 import itertools
@@ -53,50 +69,21 @@ from diffusers import (
     StableDiffusionXLPipeline,
     UNet2DConditionModel,
 )
-from diffusers.loaders import LoraLoaderMixin
-from diffusers.models.lora import LoRALinearLayer
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import compute_snr, unet_lora_state_dict
-from diffusers.utils import check_min_version, is_wandb_available
+from diffusers.training_utils import compute_snr
+from diffusers.utils import check_min_version, convert_state_dict_to_diffusers, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
+from peft import LoraConfig
+from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
+
+from blora_utils import get_target_modules, load_lora_state_dict
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
-check_min_version("0.24.0.dev0")
+check_min_version("0.32.0")
 
 logger = get_logger(__name__)
 
-
-# TODO: This function should be removed once training scripts are rewritten in PEFT
-def text_encoder_lora_state_dict(text_encoder):
-    state_dict = {}
-
-    def text_encoder_attn_modules(text_encoder):
-        from transformers import CLIPTextModel, CLIPTextModelWithProjection
-
-        attn_modules = []
-
-        if isinstance(text_encoder, (CLIPTextModel, CLIPTextModelWithProjection)):
-            for i, layer in enumerate(text_encoder.text_model.encoder.layers):
-                name = f"text_model.encoder.layers.{i}.self_attn"
-                mod = layer.self_attn
-                attn_modules.append((name, mod))
-
-        return attn_modules
-
-    for name, module in text_encoder_attn_modules(text_encoder):
-        for k, v in module.q_proj.lora_linear_layer.state_dict().items():
-            state_dict[f"{name}.q_proj.lora_linear_layer.{k}"] = v
-
-        for k, v in module.k_proj.lora_linear_layer.state_dict().items():
-            state_dict[f"{name}.k_proj.lora_linear_layer.{k}"] = v
-
-        for k, v in module.v_proj.lora_linear_layer.state_dict().items():
-            state_dict[f"{name}.v_proj.lora_linear_layer.{k}"] = v
-
-        for k, v in module.out_proj.lora_linear_layer.state_dict().items():
-            state_dict[f"{name}.out_proj.lora_linear_layer.{k}"] = v
-
-    return state_dict
+TEXT_ENCODER_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "out_proj"]
 
 
 def save_model_card(
@@ -144,7 +131,8 @@ license: openrail++
 
 These are {repo_id} LoRA adaption weights for {base_model}.
 
-The weights were trained  using [DreamBooth](https://dreambooth.github.io/).
+The weights were trained  using [DreamBooth](https://dreambooth.github.io/) with the B-LoRA
+(https://arxiv.org/abs/2403.14572) block targeting.
 
 LoRA for the text encoder was enabled: {train_text_encoder}.
 
@@ -186,7 +174,7 @@ def import_model_class_from_model_name_or_path(
 
 
 def parse_args(input_args=None):
-    parser = argparse.ArgumentParser(description="Simple example of a training script.")
+    parser = argparse.ArgumentParser(description="B-LoRA (DreamBooth LoRA) training script for SDXL.")
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
@@ -642,6 +630,15 @@ def parse_args(input_args=None):
         default=4,
         help=("The dimension of the LoRA update matrices."),
     )
+    parser.add_argument(
+        "--lora_alpha",
+        type=int,
+        default=None,
+        help=(
+            "The alpha of the LoRA update matrices. The effective LoRA scaling is alpha / rank. "
+            "Defaults to `rank`, which reproduces the scaling (1.0) of the original B-LoRA implementation."
+        ),
+    )
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -683,6 +680,9 @@ class DreamBoothDataset(Dataset):
     """
     A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
     It pre-processes the images.
+
+    Note: unlike the original implementation (which read a module-level global `args`),
+    all dataset-related options are passed explicitly.
     """
 
     def __init__(
@@ -695,6 +695,11 @@ class DreamBoothDataset(Dataset):
             size=1024,
             repeats=1,
             center_crop=False,
+            dataset_name=None,
+            dataset_config_name=None,
+            cache_dir=None,
+            image_column="image",
+            caption_column=None,
     ):
         self.size = size
         self.center_crop = center_crop
@@ -705,7 +710,7 @@ class DreamBoothDataset(Dataset):
 
         # if --dataset_name is provided or a metadata jsonl file is provided in the local --instance_data directory,
         # we load the training data using load_dataset
-        if args.dataset_name is not None:
+        if dataset_name is not None:
             try:
                 from datasets import load_dataset
             except ImportError:
@@ -718,26 +723,25 @@ class DreamBoothDataset(Dataset):
             # See more about loading custom images at
             # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
             dataset = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                cache_dir=args.cache_dir,
+                dataset_name,
+                dataset_config_name,
+                cache_dir=cache_dir,
             )
             # Preprocessing the datasets.
             column_names = dataset["train"].column_names
 
             # 6. Get the column names for input/target.
-            if args.image_column is None:
+            if image_column is None:
                 image_column = column_names[0]
                 logger.info(f"image column defaulting to {image_column}")
             else:
-                image_column = args.image_column
                 if image_column not in column_names:
                     raise ValueError(
-                        f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                        f"`--image_column` value '{image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
                     )
             instance_images = dataset["train"][image_column]
 
-            if args.caption_column is None:
+            if caption_column is None:
                 logger.info(
                     "No caption column provided, defaulting to instance_prompt for all images. If your dataset "
                     "contains captions/prompts for the images, make sure to specify the "
@@ -745,11 +749,11 @@ class DreamBoothDataset(Dataset):
                 )
                 self.custom_instance_prompts = None
             else:
-                if args.caption_column not in column_names:
+                if caption_column not in column_names:
                     raise ValueError(
-                        f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
+                        f"`--caption_column` value '{caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
                     )
-                custom_instance_prompts = dataset["train"][args.caption_column]
+                custom_instance_prompts = dataset["train"][caption_column]
                 # create final list of captions according to --repeats
                 self.custom_instance_prompts = []
                 for caption in custom_instance_prompts:
@@ -906,23 +910,6 @@ def encode_prompt(text_encoders, tokenizers, prompt, text_input_ids_list=None):
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
     return prompt_embeds, pooled_prompt_embeds
-
-
-def is_belong_to_groups(key: str, groups: list) -> bool:
-    try:
-        for g in groups:
-            if key.startswith(g):
-                return True
-        return False
-    except Exception as e:
-        raise type(e)(f'failed to is_belong_to_groups, due to: {e}')
-
-
-def filter_lora_layers(lora_state_dict: dict, groups: list) -> dict:
-    try:
-        return {k: v for k, v in lora_state_dict.items() if is_belong_to_groups(k, groups)}
-    except Exception as e:
-        raise type(e)(f'failed to filter_lora_layers, due to: {e}')
 
 
 def main(args):
@@ -1101,8 +1088,14 @@ def main(args):
     # The VAE is always in float32 to avoid NaN losses.
     vae.to(accelerator.device, dtype=torch.float32)
 
-    text_encoder_one.to(accelerator.device, dtype=weight_dtype)
-    text_encoder_two.to(accelerator.device, dtype=weight_dtype)
+    if args.train_text_encoder:
+        # Keep the text encoders in float32 when they are being trained (matching the
+        # original implementation, where text-encoder LoRA layers were float32).
+        text_encoder_one.to(accelerator.device, dtype=torch.float32)
+        text_encoder_two.to(accelerator.device, dtype=torch.float32)
+    else:
+        text_encoder_one.to(accelerator.device, dtype=weight_dtype)
+        text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -1110,7 +1103,7 @@ def main(args):
 
             xformers_version = version.parse(xformers.__version__)
             if xformers_version == version.parse("0.0.16"):
-                logger.warn(
+                logger.warning(
                     "xFormers 0.0.16 cannot be used for training in some GPUs. If you observe problems during training, "
                     "please update xFormers to at least 0.0.17. See https://huggingface.co/docs/diffusers/main/en/optimization/xformers for more details."
                 )
@@ -1120,72 +1113,39 @@ def main(args):
                 "xformers is not available. Make sure it is installed correctly"
             )
 
-    if args.gradient_checkpointing:
-        unet.enable_gradient_checkpointing()
-        if args.train_text_encoder:
-            text_encoder_one.gradient_checkpointing_enable()
-            text_encoder_two.gradient_checkpointing_enable()
+    # B-LoRA blocks: the content and style attention blocks of the SDXL UNet.
+    # The LoRA adapters are added through PEFT and target exactly the same
+    # modules as the original implementation (to_q/to_k/to_v/to_out.0 of every
+    # attention layer inside the two blocks).
+    lora_alpha = args.lora_alpha if args.lora_alpha is not None else args.rank
+    unet_lora_config = LoraConfig(
+        r=args.rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=0.0,
+        bias="none",
+        init_lora_weights=True,
+        target_modules=get_target_modules(unet),
+    )
+    unet.add_adapter(unet_lora_config)
 
-    BLORA_BLOCKS = ['up_blocks.0.attentions.0',
-                    'up_blocks.0.attentions.1']
+    # Collect the trainable LoRA parameters of the UNet.
+    unet_lora_parameters = list(filter(lambda p: p.requires_grad, unet.parameters()))
 
-    # now we will add new LoRA weights to the attention layers
-    # Set correct lora layers
-    unet_lora_parameters = []
-    for attn_processor_name, attn_processor in unet.attn_processors.items():
-        # Parse the attention module.
-        if not is_belong_to_groups(attn_processor_name, BLORA_BLOCKS):
-            continue
-        attn_module = unet
-        for n in attn_processor_name.split(".")[:-1]:
-            attn_module = getattr(attn_module, n)
-
-        # Set the `lora_layer` attribute of the attention-related matrices.
-        attn_module.to_q.set_lora_layer(
-            LoRALinearLayer(
-                in_features=attn_module.to_q.in_features,
-                out_features=attn_module.to_q.out_features,
-                rank=args.rank,
-            )
-        )
-        attn_module.to_k.set_lora_layer(
-            LoRALinearLayer(
-                in_features=attn_module.to_k.in_features,
-                out_features=attn_module.to_k.out_features,
-                rank=args.rank,
-            )
-        )
-        attn_module.to_v.set_lora_layer(
-            LoRALinearLayer(
-                in_features=attn_module.to_v.in_features,
-                out_features=attn_module.to_v.out_features,
-                rank=args.rank,
-            )
-        )
-        attn_module.to_out[0].set_lora_layer(
-            LoRALinearLayer(
-                in_features=attn_module.to_out[0].in_features,
-                out_features=attn_module.to_out[0].out_features,
-                rank=args.rank,
-            )
-        )
-
-        # Accumulate the LoRA params to optimize.
-        unet_lora_parameters.extend(attn_module.to_q.lora_layer.parameters())
-        unet_lora_parameters.extend(attn_module.to_k.lora_layer.parameters())
-        unet_lora_parameters.extend(attn_module.to_v.lora_layer.parameters())
-        unet_lora_parameters.extend(attn_module.to_out[0].lora_layer.parameters())
-
-    # The text encoder comes from 🤗 transformers, so we cannot directly modify it.
-    # So, instead, we monkey-patch the forward calls of its attention-blocks.
+    # The text encoder comes from 🤗 transformers; with PEFT we can add
+    # adapters to it directly (no monkey-patching of forward calls needed).
     if args.train_text_encoder:
-        # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
-        text_lora_parameters_one = LoraLoaderMixin._modify_text_encoder(
-            text_encoder_one, dtype=torch.float32, rank=args.rank
+        text_lora_config = LoraConfig(
+            r=args.rank,
+            lora_alpha=lora_alpha,
+            lora_dropout=0.0,
+            bias="none",
+            init_lora_weights=True,
+            target_modules=TEXT_ENCODER_TARGET_MODULES,
         )
-        text_lora_parameters_two = LoraLoaderMixin._modify_text_encoder(
-            text_encoder_two, dtype=torch.float32, rank=args.rank
-        )
+        text_encoder_one.add_adapter(text_lora_config)
+        text_encoder_two.add_adapter(text_lora_config)
+        text_lora_parameters_one = list(filter(lambda p: p.requires_grad, text_encoder_one.parameters()))
+        text_lora_parameters_two = list(filter(lambda p: p.requires_grad, text_encoder_two.parameters()))
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
@@ -1198,18 +1158,20 @@ def main(args):
 
             for model in models:
                 if isinstance(model, type(accelerator.unwrap_model(unet))):
-                    unet_lora_layers_to_save = unet_lora_state_dict(model)
+                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
+                    )
                 elif isinstance(
                         model, type(accelerator.unwrap_model(text_encoder_one))
                 ):
-                    text_encoder_one_lora_layers_to_save = text_encoder_lora_state_dict(
-                        model
+                    text_encoder_one_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
                     )
                 elif isinstance(
                         model, type(accelerator.unwrap_model(text_encoder_two))
                 ):
-                    text_encoder_two_lora_layers_to_save = text_encoder_lora_state_dict(
-                        model
+                    text_encoder_two_lora_layers_to_save = convert_state_dict_to_diffusers(
+                        get_peft_model_state_dict(model)
                     )
                 else:
                     raise ValueError(f"unexpected save model: {model.__class__}")
@@ -1241,28 +1203,34 @@ def main(args):
             else:
                 raise ValueError(f"unexpected save model: {model.__class__}")
 
-        lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(input_dir)
-        LoraLoaderMixin.load_lora_into_unet(
-            lora_state_dict, network_alphas=network_alphas, unet=unet_
-        )
+        # The adapters were already created (before accelerator.prepare), so we only
+        # need to set their weights from the checkpoint. `load_lora_state_dict` also
+        # normalizes legacy key formats.
+        state_dict = load_lora_state_dict(input_dir)
 
-        text_encoder_state_dict = {
-            k: v for k, v in lora_state_dict.items() if "text_encoder." in k
-        }
-        LoraLoaderMixin.load_lora_into_text_encoder(
-            text_encoder_state_dict,
-            network_alphas=network_alphas,
-            text_encoder=text_encoder_one_,
-        )
+        def to_peft_keys(sd):
+            return {
+                k.replace(".lora.down.weight", ".lora_A.weight")
+                .replace(".lora.up.weight", ".lora_B.weight")
+                .replace(".lora_linear_layer.down.weight", ".lora_A.weight")
+                .replace(".lora_linear_layer.up.weight", ".lora_B.weight"): v
+                for k, v in sd.items()
+            }
 
-        text_encoder_2_state_dict = {
-            k: v for k, v in lora_state_dict.items() if "text_encoder_2." in k
-        }
-        LoraLoaderMixin.load_lora_into_text_encoder(
-            text_encoder_2_state_dict,
-            network_alphas=network_alphas,
-            text_encoder=text_encoder_two_,
-        )
+        if unet_ is not None:
+            unet_sd = {k[len("unet."):]: v for k, v in state_dict.items() if k.startswith("unet.")}
+            if unet_sd:
+                set_peft_model_state_dict(unet_, to_peft_keys(unet_sd), adapter_name="default")
+
+        if text_encoder_one_ is not None:
+            te_sd = {k[len("text_encoder."):]: v for k, v in state_dict.items() if k.startswith("text_encoder.")}
+            if te_sd:
+                set_peft_model_state_dict(text_encoder_one_, to_peft_keys(te_sd), adapter_name="default")
+
+        if text_encoder_two_ is not None:
+            te2_sd = {k[len("text_encoder_2."):]: v for k, v in state_dict.items() if k.startswith("text_encoder_2.")}
+            if te2_sd:
+                set_peft_model_state_dict(text_encoder_two_, to_peft_keys(te2_sd), adapter_name="default")
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1307,14 +1275,14 @@ def main(args):
 
     # Optimizer creation
     if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
-        logger.warn(
+        logger.warning(
             f"Unsupported choice of optimizer: {args.optimizer}.Supported optimizers include [adamW, prodigy]."
             "Defaulting to adamW"
         )
         args.optimizer = "adamw"
 
     if args.use_8bit_adam and not args.optimizer.lower() == "adamw":
-        logger.warn(
+        logger.warning(
             f"use_8bit_adam is ignored when optimizer is not set to 'AdamW'. Optimizer was "
             f"set to {args.optimizer.lower()}"
         )
@@ -1350,11 +1318,11 @@ def main(args):
         optimizer_class = prodigyopt.Prodigy
 
         if args.learning_rate <= 0.1:
-            logger.warn(
+            logger.warning(
                 "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
             )
         if args.train_text_encoder and args.text_encoder_lr:
-            logger.warn(
+            logger.warning(
                 f"Learning rates were provided both for the unet and the text encoder- e.g. text_encoder_lr:"
                 f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
                 f"When using prodigy only learning_rate is used as the initial learning rate."
@@ -1386,6 +1354,11 @@ def main(args):
         size=args.resolution,
         repeats=args.repeats,
         center_crop=args.center_crop,
+        dataset_name=args.dataset_name,
+        dataset_config_name=args.dataset_config_name,
+        cache_dir=args.cache_dir,
+        image_column=args.image_column,
+        caption_column=args.caption_column,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -1452,7 +1425,8 @@ def main(args):
     if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
         del tokenizers, text_encoders
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
     # pack the statically computed variables appropriately here. This is so that we don't
@@ -1831,18 +1805,10 @@ def main(args):
                     f"Running validation... \n Generating {args.num_validation_images} images with prompt:"
                     f" {args.validation_prompt}."
                 )
-                # create pipeline
-                if not args.train_text_encoder:
-                    text_encoder_one = text_encoder_cls_one.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        subfolder="text_encoder",
-                        revision=args.revision,
-                    )
-                    text_encoder_two = text_encoder_cls_two.from_pretrained(
-                        args.pretrained_model_name_or_path,
-                        subfolder="text_encoder_2",
-                        revision=args.revision,
-                    )
+                # create pipeline. The frozen text encoders are reused as-is when they
+                # are not being trained; when `--train_text_encoder` is set, the
+                # unwrapped (PEFT-adapted) encoders are used so the validation shows
+                # the current state of training.
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     vae=vae,
@@ -1901,23 +1867,26 @@ def main(args):
                         )
 
                 del pipeline
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         unet = accelerator.unwrap_model(unet)
         unet = unet.to(torch.float32)
-        unet_lora_layers = unet_lora_state_dict(unet)
+        unet_lora_layers = convert_state_dict_to_diffusers(
+            get_peft_model_state_dict(unet)
+        )
 
         if args.train_text_encoder:
-            text_encoder_one = accelerator.unwrap_model(text_encoder_one)
-            text_encoder_lora_layers = text_encoder_lora_state_dict(
-                text_encoder_one.to(torch.float32)
+            text_encoder_one = accelerator.unwrap_model(text_encoder_one).to(torch.float32)
+            text_encoder_lora_layers = convert_state_dict_to_diffusers(
+                get_peft_model_state_dict(text_encoder_one)
             )
-            text_encoder_two = accelerator.unwrap_model(text_encoder_two)
-            text_encoder_2_lora_layers = text_encoder_lora_state_dict(
-                text_encoder_two.to(torch.float32)
+            text_encoder_two = accelerator.unwrap_model(text_encoder_two).to(torch.float32)
+            text_encoder_2_lora_layers = convert_state_dict_to_diffusers(
+                get_peft_model_state_dict(text_encoder_two)
             )
         else:
             text_encoder_lora_layers = None
@@ -1938,6 +1907,9 @@ def main(args):
         del optimizer
         if args.train_text_encoder:
             del text_encoder_lora_layers, text_encoder_2_lora_layers
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # Final inference
         # Load previous pipeline
@@ -1983,7 +1955,6 @@ def main(args):
             )
             images = pipeline(args.validation_prompt, num_images_per_prompt=args.num_validation_images,
                               generator=generator).images
-
 
             for tracker in accelerator.trackers:
                 if tracker.name == "tensorboard":

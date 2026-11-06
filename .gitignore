@@ -1,0 +1,28 @@
+# Training outputs
+checkpoint-*/
+logs/
+lora-dreambooth-model*/
+blora-*/
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Tooling
+.ipynb_checkpoints/
+.pytest_cache/
+.cache/
+wandb/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
